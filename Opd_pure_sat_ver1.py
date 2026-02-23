@@ -9,7 +9,7 @@ The OPD problem:
   2. Minimize max dot product between all pairs of distinct rows
 """
 
-from pysat.solvers import Cadical153
+from pysat.solvers import Glucose4
 import argparse
 import time
 import itertools
@@ -17,7 +17,6 @@ import threading
 import math
 import os
 import re
-from pysat.solvers import Cadical153
 from pysat.card import CardEnc, EncType
 
 
@@ -41,7 +40,7 @@ class OpdSAT:
         
         if self.verbose:
             print(f"OPD Instance: v={v}, b={b}, r={r}")
-            print(f"Solver: Cadical153 (PySAT)")
+            print(f"Solver: Cadical195 (PySAT)")
             print(f"Total variables: {self.var_id - 1}")
     
     def compute_lower_bound(self):
@@ -89,16 +88,56 @@ class OpdSAT:
             
             self.add_at_most_k(solver, overlap_vars, max_overlap)
     
-    def add_symmetry_breaking(self, solver):
-        """Add symmetry breaking constraints"""
-        for j in range(self.r):
-            solver.add_clause([self.x[0][j]])
+    def _add_lex_constraint(self, solver, a, b_vec, n):
+        """Add SAT encoding of a <=_lex b_vec (binary vectors of length n).
         
-        for j in range(self.r, self.b):
-            solver.add_clause([-self.x[0][j]])
-            
+        Uses auxiliary prefix-equality variables p[k]:
+          p[k] = True  iff  a[0..k] == b_vec[0..k]
+        Constraint (a[0] <= b[0]) is always enforced.
+        For each subsequent position k+1: if p[k], then a[k+1] <= b_vec[k+1].
+        """
+        # Position 0: a[0] <= b[0]  (no prefix needed)
+        solver.add_clause([-a[0], b_vec[0]])
+
+        prev_p = None  # p[-1] = True (empty prefix, always equal)
+
+        for k in range(n - 1):
+            p_k = self.var_id
+            self.var_id += 1
+
+            if prev_p is None:
+                # p[0] = (a[0] == b_vec[0])
+                solver.add_clause([-p_k, -a[0],    b_vec[0]])   # p[0] => a[0]->b[0]
+                solver.add_clause([-p_k,  a[0],   -b_vec[0]])   # p[0] => b[0]->a[0]
+                solver.add_clause([-a[0],   -b_vec[0],  p_k])   # a=b=1 => p[0]
+                solver.add_clause([ a[0],    b_vec[0],  p_k])   # a=b=0 => p[0]
+            else:
+                # p[k] = prev_p AND (a[k] == b_vec[k])
+                solver.add_clause([-p_k, prev_p])                        # p[k] => prev_p
+                solver.add_clause([-p_k, -a[k],    b_vec[k]])            # p[k] => a[k]->b[k]
+                solver.add_clause([-p_k,  a[k],   -b_vec[k]])            # p[k] => b[k]->a[k]
+                solver.add_clause([-prev_p, -a[k], -b_vec[k],  p_k])    # prev AND a=b=1 => p[k]
+                solver.add_clause([-prev_p,  a[k],  b_vec[k],  p_k])    # prev AND a=b=0 => p[k]
+
+            # Main lex constraint at position k+1: if p[k], then a[k+1] <= b_vec[k+1]
+            solver.add_clause([-p_k, -a[k + 1], b_vec[k + 1]])
+
+            prev_p = p_k
+
+    def add_symmetry_breaking(self, solver):
+        """Add symmetry breaking: lex ordering on rows and columns."""
+        # Consecutive rows are lexicographically non-decreasing
+        for i in range(self.v - 1):
+            self._add_lex_constraint(solver, self.x[i], self.x[i + 1], self.b)
+
+        # Consecutive columns are lexicographically non-decreasing
+        for j in range(self.b - 1):
+            col_j     = [self.x[i][j]     for i in range(self.v)]
+            col_j1    = [self.x[i][j + 1] for i in range(self.v)]
+            self._add_lex_constraint(solver, col_j, col_j1, self.v)
+
         if self.verbose:
-            print("Added symmetry breaking")
+            print("Added symmetry breaking (lex rows + lex columns)")
     
     def extract_matrix(self, model):
         """Extract solution matrix from SAT model"""
@@ -140,7 +179,7 @@ class OpdSAT:
     
     def solve_with_max_overlap(self, max_overlap, timeout=120):
         """Solve OPD with given max overlap constraint"""
-        solver = Cadical153()
+        solver = Glucose4()
         start_time = time.time()
         
         self.add_row_constraints(solver)
@@ -150,28 +189,29 @@ class OpdSAT:
         if self.verbose:
             print(f"Solving with lambda = {max_overlap}...")
         
-        result = [None]
+        timed_out = [False]
         
-        def solve_thread():
-            try:
-                result[0] = solver.solve()
-            except:
-                result[0] = False
+        def interrupt_solver():
+            timed_out[0] = True
+            solver.interrupt()
         
-        thread = threading.Thread(target=solve_thread)
-        thread.daemon = True
-        thread.start()
-        thread.join(timeout=timeout)
+        timer = threading.Timer(timeout, interrupt_solver)
+        timer.start()
+        
+        try:
+            sat = solver.solve_limited(expect_interrupt=True)
+        finally:
+            timer.cancel()
         
         solve_time = time.time() - start_time
         
-        if thread.is_alive():
+        if timed_out[0] or sat is None:
             if self.verbose:
                 print(f"TIMEOUT after {solve_time:.3f}s")
             solver.delete()
             return 'TIMEOUT', None, solve_time
         
-        if result[0]:
+        if sat:
             model = solver.get_model()
             matrix = self.extract_matrix(model)
             
@@ -299,8 +339,8 @@ if __name__ == "__main__":
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python Opd_multi_sat_ver1.py --input input/small/small_1.txt
-  python Opd_multi_sat_ver1.py --input input/small
+ 
+  python Opd_pure_sat_ver1.py --input input/small
         """
     )
     

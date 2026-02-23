@@ -1,5 +1,5 @@
 """
-SAT-based OPD solver using Cadical153 with Preliminary Phase
+SAT-based OPD solver using Cadical195 with Preliminary Phase
 
 The OPD problem:
 - Given: v (rows), b (columns), r (row weight)
@@ -13,7 +13,7 @@ Key Improvement:
 - Narrows search space before main binary search
 """
 
-from pysat.solvers import Cadical153
+from pysat.solvers import Cadical195
 import argparse
 import time
 import itertools
@@ -45,7 +45,7 @@ class OpdSAT:
         
         if self.verbose:
             print(f"OPD Instance: v={v}, b={b}, r={r}")
-            print(f"Solver: Cadical153 (PySAT)")
+            print(f"Solver: Cadical195 (PySAT)")
             print(f"Total variables: {self.var_id - 1}")
 
     def get_var(self, i, j):
@@ -180,7 +180,7 @@ class OpdSAT:
     
     def solve_with_max_overlap(self, max_overlap, timeout=120):
         """Solve OPD with given max overlap constraint"""
-        solver = Cadical153()
+        solver = Cadical195()
         start_time = time.time()
         
         self.add_row_constraints(solver)
@@ -318,7 +318,7 @@ class OpdSAT:
             print(f"Starting Linear Descent from lambda = {ub}")
             print(f"Lower Bound: {lb}")
 
-        solver = Cadical153()
+        solver = Cadical195()
         start_build = time.time()
         
         self.add_row_constraints(solver)
