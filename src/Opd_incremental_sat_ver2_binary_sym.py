@@ -32,7 +32,7 @@ Timeout:
   We use SIGALRM (Unix) to time out each solve() call safely in the main thread.
 """
 
-from pysat.solvers import Cadical195
+from pysat.solvers import Solver
 from pysat.card import CardEnc, EncType
 import argparse
 import itertools
@@ -40,6 +40,16 @@ import math
 import os
 import re
 import time
+import multiprocessing
+import sys
+
+ENCODING_MAP = {
+    'sortnetwrk': EncType.sortnetwrk,
+    'seqcounter': EncType.seqcounter,
+    'totalizer': EncType.totalizer,
+    'mtotalizer': EncType.mtotalizer,
+    'pairwise': EncType.pairwise
+}
 # ---------------------------------------------------------------------------
 # Totalizer Construction (upward clauses only)
 # ---------------------------------------------------------------------------
@@ -124,10 +134,14 @@ class OpdReifiedBound:
           UNSAT?             -> optimal proven = last SAT's M; stop
     """
 
-    def __init__(self, v, b, r, verbose=True):
+    def __init__(self, v, b, r, solver_name='cadical195', encoding_name='sortnetwrk', sym_options=None, verbose=True):
         self.v = v
         self.b = b
         self.r = r
+        self.solver_name = solver_name
+        self.encoding_name = encoding_name
+        self.encoding_type = ENCODING_MAP.get(encoding_name, EncType.sortnetwrk)
+        self.sym_options = sym_options or []
         self.verbose = verbose
         self._next_var = 1
 
@@ -146,6 +160,7 @@ class OpdReifiedBound:
 
         if verbose:
             print(f"OPD Reified Bound: v={v}, b={b}, r={r}")
+            print(f"  Solver: {self.solver_name} | Encoding: {self.encoding_name}")
             print(f"  x vars:   {v * b}")
             print(f"  s vars:   {len(self.pairs) * b}")
             print(f"  b_M vars: {r + 1}")
@@ -177,7 +192,7 @@ class OpdReifiedBound:
             o_vars: dict (i,j) -> list of output vars [o_0..o_{b-1}]
                     o[t] = 1 => D_{ij} >= t+1
         """
-        solver = Cadical195()
+        solver = Solver(name=self.solver_name)
 
         # (A) Row cardinality: sum_k x[i][k] = r
         if self.verbose:
@@ -187,7 +202,7 @@ class OpdReifiedBound:
                 lits=self.x[i],
                 bound=self.r,
                 top_id=self._next_var - 1,
-                encoding=EncType.totalizer,
+                encoding=self.encoding_type,
             )
             self._next_var = cnf.nv + 1
             for cl in cnf.clauses:
@@ -248,14 +263,66 @@ class OpdReifiedBound:
 
         return solver, o_vars
 
+    def _add_lex_constraint(self, solver, a, b_vec, n):
+        """Add SAT encoding of a <=_lex b_vec (binary vectors of length n)."""
+        solver.add_clause([-a[0], b_vec[0]])
+        prev_p = None
+
+        for k in range(n - 1):
+            p_k = self._next_var
+            self._next_var += 1
+
+            if prev_p is None:
+                solver.add_clause([-p_k, -a[0], b_vec[0]])
+                solver.add_clause([-p_k, a[0], -b_vec[0]])
+                solver.add_clause([-a[0], -b_vec[0], p_k])
+                solver.add_clause([a[0], b_vec[0], p_k])
+            else:
+                solver.add_clause([-p_k, prev_p])
+                solver.add_clause([-p_k, -a[k], b_vec[k]])
+                solver.add_clause([-p_k, a[k], -b_vec[k]])
+                solver.add_clause([-prev_p, -a[k], -b_vec[k], p_k])
+                solver.add_clause([-prev_p, a[k], b_vec[k], p_k])
+
+            solver.add_clause([-p_k, -a[k + 1], b_vec[k + 1]])
+            prev_p = p_k
+
     def _add_symmetry_breaking(self, solver):
-        """Fix row 0 and add lex proxy constraints."""
-        for k in range(self.r):
-            solver.add_clause([self.x[0][k]])
-        for k in range(self.r, self.b):
-            solver.add_clause([-self.x[0][k]])
-        for i in range(1, self.v - 1):
-            solver.add_clause([-self.x[i + 1][0], self.x[i][0]])
+        fixed_r = 'r' in self.sym_options
+        use_lex_row = 'lex_row' in self.sym_options
+        use_lex_col = 'lex_col' in self.sym_options
+
+        sym_methods = []
+
+        if fixed_r:
+            for j in range(self.r):
+                solver.add_clause([self.x[0][j]])
+            for j in range(self.r, self.b):
+                solver.add_clause([-self.x[0][j]])
+            sym_methods.append("fixed_r")
+
+        if use_lex_row:
+            sym_methods.append("lex_row")
+            for i in range(self.v - 1):
+                if fixed_r:
+                    self._add_lex_constraint(solver, self.x[i + 1], self.x[i], self.b)
+                else:
+                    self._add_lex_constraint(solver, self.x[i], self.x[i + 1], self.b)
+
+        if use_lex_col:
+            sym_methods.append("lex_col")
+            for j in range(self.b - 1):
+                col_j     = [self.x[i][j]     for i in range(self.v)]
+                col_j1    = [self.x[i][j + 1] for i in range(self.v)]
+                if fixed_r:
+                    self._add_lex_constraint(solver, col_j1, col_j, self.v)
+                else:
+                    self._add_lex_constraint(solver, col_j, col_j1, self.v)
+
+        self.applied_sym = "+".join(sym_methods) if sym_methods else "none"
+
+        if self.verbose:
+            print(f"    Added symmetry breaking: {self.applied_sym}")
 
     # ------------------------------------------------------------------
     # Solve: UB -> LB, assumption-based
@@ -330,8 +397,10 @@ class OpdReifiedBound:
             print(f"\n  Binary search done in {iteration} iteration(s)."
                   f"  Optimal proven = {best_M}")
 
+        n_vars = self._next_var - 1
+        n_clauses = solver.nof_clauses()
         solver.delete()
-        return best_M, best_matrix, build_time + total_solve
+        return best_M, best_matrix, build_time + total_solve, n_vars, n_clauses
 
     # ------------------------------------------------------------------
     # Utilities
@@ -400,13 +469,12 @@ def parse_input_file(filepath):
     return None
 
 
-import multiprocessing
-import sys
-
-def _solve_worker(v, b, r, quiet, queue):
+def _solve_worker(v, b, r, solver_name, encoding_name, sym_options, quiet, queue):
     try:
-        odp = OpdReifiedBound(v, b, r, verbose=not quiet)
-        optimal_M, matrix, total_time = odp.solve()
+        t_start = time.time()
+        odp = OpdReifiedBound(v, b, r, solver_name=solver_name, encoding_name=encoding_name, sym_options=sym_options, verbose=not quiet)
+        optimal_M, matrix, _, n_vars, n_clauses = odp.solve()
+        total_time = time.time() - t_start
         
         errors = []
         actual = optimal_M
@@ -417,6 +485,9 @@ def _solve_worker(v, b, r, quiet, queue):
             'optimal_lambda': optimal_M,
             'matrix': matrix,
             'total_time': total_time,
+            'n_vars': n_vars,
+            'n_clauses': n_clauses,
+            'applied_sym': getattr(odp, 'applied_sym', 'none'),
             'status': 'Verification Failed' if errors else ('Solved' if matrix is not None else 'No Solution'),
             'errors': errors,
             'actual': actual
@@ -424,7 +495,7 @@ def _solve_worker(v, b, r, quiet, queue):
     except Exception as e:
         queue.put({'error': str(e)})
 
-def solve_from_file(filepath, overall_timeout=600, quiet=False):
+def solve_from_file(filepath, solver_name='cadical195', encoding_name='sortnetwrk', sym_options=None, timeout=600, quiet=False):
     """Read params from file and solve. Returns result dict."""
     filename = os.path.basename(filepath)
     if not quiet:
@@ -435,7 +506,8 @@ def solve_from_file(filepath, overall_timeout=600, quiet=False):
     params = parse_input_file(filepath)
     if not params:
         return {'File': filename, 'v': None, 'b': None, 'r': None,
-                'Optimal Lambda': None, 'Time (s)': 0, 'Status': 'Parse Error'}
+                'Solver': solver_name, 'Encoding': encoding_name,
+                'Optimal Lambda': None, 'Variables': 0, 'Clauses': 0, 'Sym Method': 'none', 'Time (s)': 0, 'Status': 'Parse Error'}
 
     v, b, r = params['v'], params['b'], params['r']
     if not quiet:
@@ -444,21 +516,22 @@ def solve_from_file(filepath, overall_timeout=600, quiet=False):
     queue = multiprocessing.Queue()
     start_time = time.time()
 
-    p = multiprocessing.Process(target=_solve_worker, args=(v, b, r, quiet, queue))
+    p = multiprocessing.Process(target=_solve_worker, args=(v, b, r, solver_name, encoding_name, sym_options, quiet, queue))
     p.start()
 
     try:
-        p.join(timeout=overall_timeout)
+        p.join(timeout=timeout)
         
         elapsed = time.time() - start_time
         
         if p.is_alive():
-            if not quiet: print(f"\nTIMEOUT strictly enforced after {overall_timeout} seconds.")
+            if not quiet: print(f"\nTIMEOUT strictly enforced after {timeout} seconds.")
             p.terminate()
             p.join()
             return {
                 'File': filename, 'v': v, 'b': b, 'r': r,
-                'Optimal Lambda': None, 'Time (s)': round(elapsed, 3), 'Status': 'Timeout'
+                'Solver': solver_name, 'Encoding': encoding_name,
+                'Optimal Lambda': None, 'Variables': 0, 'Clauses': 0, 'Sym Method': "+".join(sym_options) if sym_options else 'none', 'Time (s)': round(elapsed, 3), 'Status': 'Timeout'
             }
     except KeyboardInterrupt:
         print("\n[Ctrl+C] Đã tiếp nhận yêu cầu dừng từ người dùng. Đang hủy tiến trình...")
@@ -472,13 +545,17 @@ def solve_from_file(filepath, overall_timeout=600, quiet=False):
             if not quiet: print(f"Solver error: {result['error']}")
             return {
                 'File': filename, 'v': v, 'b': b, 'r': r,
-                'Optimal Lambda': None, 'Time (s)': 0, 'Status': f"Error: {result['error']}"
+                'Solver': solver_name, 'Encoding': encoding_name,
+                'Optimal Lambda': None, 'Variables': 0, 'Clauses': 0, 'Sym Method': 'none', 'Time (s)': 0, 'Status': f"Error: {result['error']}"
             }
             
         optimal_M = result['optimal_lambda']
         matrix = result['matrix']
-        total_time = result['total_time']
+        total_time = elapsed
         status = result['status']
+        n_vars = result.get('n_vars', 0)
+        n_clauses = result.get('n_clauses', 0)
+        applied_sym = result.get('applied_sym', 'none')
         
         if status == 'Verification Failed' and not quiet:
             for e in result['errors']:
@@ -490,6 +567,8 @@ def solve_from_file(filepath, overall_timeout=600, quiet=False):
             print(f"  Optimal lambda = {optimal_M}")
             print(f"  Verified max overlap = {actual}")
             print(f"  Total time = {total_time:.3f}s")
+            print(f"  Solver: {solver_name}, Encoding: {encoding_name}")
+            print(f"  Variables: {n_vars}, Clauses: {n_clauses}, Sym Method: {applied_sym}")
             if optimal_M == lb:
                 print(f"  ✓ Optimal! (matches lower bound {lb})")
             else:
@@ -498,14 +577,16 @@ def solve_from_file(filepath, overall_timeout=600, quiet=False):
             print(f"\nBest M = {optimal_M}, Time = {total_time:.3f}s")
 
         return {'File': filename, 'v': v, 'b': b, 'r': r,
-                'Optimal Lambda': optimal_M,
+                'Solver': solver_name, 'Encoding': encoding_name,
+                'Optimal Lambda': optimal_M, 'Variables': n_vars, 'Clauses': n_clauses, 'Sym Method': applied_sym,
                 'Time (s)': round(total_time, 3),
                 'Status': status}
     else:
         if not quiet: print(f"Process crashed or returned no result.")
         return {
             'File': filename, 'v': v, 'b': b, 'r': r,
-            'Optimal Lambda': None, 'Time (s)': round(elapsed, 3), 'Status': 'Crashed'
+            'Solver': solver_name, 'Encoding': encoding_name,
+            'Optimal Lambda': None, 'Variables': 0, 'Clauses': 0, 'Sym Method': 'none', 'Time (s)': round(elapsed, 3), 'Status': 'Crashed'
         }
 
 
@@ -525,15 +606,21 @@ Strategy: Build once, activate gradually (UB -> LB search).
      UNSAT -> optimal proven = last SAT M; stop.
 
 Examples:
-  python Opd_reified_bound_sat.py --input input/small/small_1.txt
-  python Opd_reified_bound_sat.py --input input/small
-  python Opd_reified_bound_sat.py --input input/small --timeout 120 --quiet
+  python Opd_incremental_sat_ver2_binary_sym.py --input input/small/small_1.txt
+  python Opd_incremental_sat_ver2_binary_sym.py --input input/small --sym lex_row lex_col r --timeout 300
+  python Opd_incremental_sat_ver2_binary_sym.py --input input/small --solver glucose4 --encoding seqcounter
         """,
     )
     parser.add_argument('--input', type=str, required=True,
                         help='Input file or directory of .txt files')
-    parser.add_argument('--overall_timeout', type=int, default=600,
+    parser.add_argument('--timeout', type=int, default=3600,
                         help='Allowed Execution Time in seconds (default: 600)')
+    parser.add_argument('--solver', type=str, default='cadical195', choices=['cadical195', 'glucose3', 'glucose4', 'minisat22', 'lingeling'],
+                        help='SAT solver to use')
+    parser.add_argument('--encoding', type=str, default='sortnetwrk', choices=['sortnetwrk', 'seqcounter', 'totalizer', 'mtotalizer', 'pairwise'],
+                        help='Cardinality encoding method')
+    parser.add_argument('--sym', nargs='+', default=[],
+                        help='Symmetry breaking methods (e.g., lex_row lex_col r)')
     parser.add_argument('--quiet', action='store_true',
                         help='Suppress verbose output')
 
@@ -545,7 +632,7 @@ Examples:
         if os.path.exists(alt):
             input_path = alt
 
-    COLUMNS = ['File', 'v', 'b', 'r', 'Optimal Lambda', 'Time (s)', 'Status']
+    COLUMNS = ['File', 'v', 'b', 'r', 'Solver', 'Encoding', 'Optimal Lambda', 'Variables', 'Clauses', 'Sym Method', 'Time (s)', 'Status']
 
     if os.path.isdir(input_path):
         print(f"Processing directory: {input_path}")
@@ -566,7 +653,8 @@ Examples:
 
             for fname in files:
                 res = solve_from_file(os.path.join(input_path, fname),
-                                      overall_timeout=args.overall_timeout, quiet=args.quiet)
+                                      solver_name=args.solver, encoding_name=args.encoding,
+                                      sym_options=args.sym, timeout=args.timeout, quiet=args.quiet)
                 if res and has_xlsx:
                     if not os.path.exists(output_xlsx):
                         wb = openpyxl.Workbook(); ws = wb.active
@@ -580,6 +668,7 @@ Examples:
             print(f"Done. Results saved to: {output_xlsx}" if has_xlsx else "Done.")
 
     elif os.path.isfile(input_path):
-        solve_from_file(input_path, overall_timeout=args.overall_timeout, quiet=args.quiet)
+        solve_from_file(input_path, solver_name=args.solver, encoding_name=args.encoding,
+                        sym_options=args.sym, timeout=args.timeout, quiet=args.quiet)
     else:
         print(f"Error: '{args.input}' not found.")
