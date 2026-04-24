@@ -83,12 +83,13 @@ class OpdSAT:
         solver.append_formula(cnf)
         self.var_id = cnf.nv
     
-    def add_row_constraints(self, solver):
+    def add_row_constraints(self, solver, push_callback=None):
         """Add constraint: each row sums to r"""
         for i in range(self.v):
             self.add_exactly_r(solver, self.x[i])
+            if push_callback: push_callback()
     
-    def add_overlap_constraints(self, solver, max_overlap):
+    def add_overlap_constraints(self, solver, max_overlap, push_callback=None):
         """Add constraint: dot product between any two rows <= max_overlap"""
         for i1, i2 in itertools.combinations(range(self.v), 2):
             overlap_vars = []
@@ -102,6 +103,7 @@ class OpdSAT:
                 solver.add_clause([-self.x[i1][j], -self.x[i2][j], y])
             
             self.add_at_most_k(solver, overlap_vars, max_overlap)
+            if push_callback: push_callback()
     def _add_lex_constraint(self, solver, a, b_vec, n):
         """Add SAT encoding of a <=_lex b_vec (binary vectors of length n).
         
@@ -216,14 +218,30 @@ class OpdSAT:
             row_str = ''.join(str(x) for x in row)
             print(f"  Row {i:2d}: {row_str} (sum={sum(row)})")
     
-    def solve_with_max_overlap(self, max_overlap, timeout=120):
+    def solve_with_max_overlap(self, max_overlap, timeout=120, queue=None):
         """Solve OPD with given max overlap constraint"""
         solver = Solver(name=self.solver_name)
         start_time = time.time()
         
-        self.add_row_constraints(solver)
-        self.add_overlap_constraints(solver, max_overlap)
+        last_push_time = [time.time()]
+        def push_stats(force=False):
+            if queue is not None:
+                current_time = time.time()
+                if force or current_time - last_push_time[0] > 1.0:
+                    try:
+                        queue.put({
+                            'n_vars': solver.nof_vars(),
+                            'n_clauses': solver.nof_clauses(),
+                            'applied_sym': getattr(self, 'applied_sym', 'none')
+                        })
+                        last_push_time[0] = current_time
+                    except Exception:
+                        pass
+        
+        self.add_row_constraints(solver, push_stats)
+        self.add_overlap_constraints(solver, max_overlap, push_stats)
         self.add_symmetry_breaking(solver)
+        push_stats(force=True)
         
         if self.verbose:
             print(f"Solving with lambda = {max_overlap}...")
@@ -304,7 +322,7 @@ class OpdSAT:
             
             # Pass the smaller of the remaining time or the specified timeout 
             # (though here timeout IS the global timeout)
-            status, matrix, solve_time, n_vars, n_clauses = self.solve_with_max_overlap(mid, remaining_time)
+            status, matrix, solve_time, n_vars, n_clauses = self.solve_with_max_overlap(mid, remaining_time, queue)
             total_time += solve_time
             best_vars = n_vars
             best_clauses = n_clauses
@@ -430,11 +448,14 @@ def solve_from_file(filepath, solver_name='cadical195', encoding_name='sortnetwr
             total_time = round(elapsed, 3)
             while not queue.empty():
                 result = queue.get()
+                if 'n_vars' in result:
+                    best_vars = max(best_vars, result['n_vars'])
+                if 'n_clauses' in result:
+                    best_clauses = max(best_clauses, result['n_clauses'])
+                if 'applied_sym' in result:
+                    applied_sym = result.get('applied_sym', applied_sym)
                 if 'optimal_lambda' in result and result['optimal_lambda'] is not None:
                     optimal_lambda = result['optimal_lambda']
-                    best_vars = result.get('n_vars', 0)
-                    best_clauses = result.get('n_clauses', 0)
-                    applied_sym = result.get('applied_sym', applied_sym)
             
             if not quiet and optimal_lambda is not None:
                 print(f"Partial Result before TIMEOUT: Optimal lambda = {optimal_lambda}")
@@ -453,12 +474,19 @@ def solve_from_file(filepath, solver_name='cadical195', encoding_name='sortnetwr
         
     elapsed = time.time() - start_time
     result = None
+    best_vars = 0
+    best_clauses = 0
     while not queue.empty():
         res = queue.get()
         if 'error' in res:
             result = res
             break
-        result = res
+        if 'n_vars' in res:
+            best_vars = max(best_vars, res['n_vars'])
+        if 'n_clauses' in res:
+            best_clauses = max(best_clauses, res['n_clauses'])
+        if 'status' in res:
+            result = res
 
     if result is not None:
         if 'error' in result:
@@ -470,8 +498,8 @@ def solve_from_file(filepath, solver_name='cadical195', encoding_name='sortnetwr
                  'Time (s)': 0, 'Status': f"Error: {result['error']}"
              }
              
-        optimal_lambda = result['optimal_lambda']
-        matrix = result['matrix']
+        optimal_lambda = result.get('optimal_lambda')
+        matrix = result.get('matrix')
         total_time = elapsed  # Use elapsed time (includes parsing and overhead)
         
         result_data = {
@@ -480,8 +508,8 @@ def solve_from_file(filepath, solver_name='cadical195', encoding_name='sortnetwr
             'Solver': solver_name,
             'Encoding': encoding_name,
             'Optimal Lambda': optimal_lambda,
-            'Variables': result.get('n_vars', 0),
-            'Clauses': result.get('n_clauses', 0),
+            'Variables': best_vars,
+            'Clauses': best_clauses,
             'Sym Method': result.get('applied_sym', 'none'),
             'Time (s)': round(total_time, 3), # Full execution time including file parsing
             'Status': result['status']

@@ -1,6 +1,7 @@
 *.xml
 *.log
 venv
+.venv/
 __pycache__/
 EvalMaxSAT
 *.Identifier

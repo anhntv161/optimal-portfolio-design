@@ -328,7 +328,7 @@ class OpdReifiedBound:
     # Solve: UB -> LB, assumption-based
     # ------------------------------------------------------------------
 
-    def solve(self):
+    def solve(self, out_queue=None):
         """
         Assumption-based Incremental SAT with BINARY SEARCH on M.
 
@@ -340,7 +340,7 @@ class OpdReifiedBound:
                 SAT   -> best_M = actual_M; hi = actual_M - 1  (go lower)
                 UNSAT -> lo = mid + 1                           (go higher)
 
-        Returns: (optimal_M, matrix, total_time)
+        Returns: (optimal_M, matrix, total_time, n_vars, n_clauses)
         """
         lb = self.compute_lower_bound()
         if self.verbose:
@@ -353,6 +353,18 @@ class OpdReifiedBound:
         if self.verbose:
             print(f"Build time: {build_time:.3f}s")
             print(f"\nBinary search: M in [{lb}, {self.r}]")
+
+        n_vars = self._next_var - 1
+        n_clauses = solver.nof_clauses()
+
+        if out_queue:
+            out_queue.put({
+                'stats_only': True,
+                'n_vars': n_vars,
+                'n_clauses': n_clauses,
+                'applied_sym': getattr(self, 'applied_sym', 'none')
+            })
+            time.sleep(0.05)  # flush multiprocessing queue before GIL blocks
 
         best_M      = self.r + 1   # sentinel: no solution yet
         best_matrix = None
@@ -383,6 +395,15 @@ class OpdReifiedBound:
                 actual = self._compute_max_overlap(matrix)
                 best_M = actual
                 best_matrix = matrix
+                
+                if out_queue:
+                    out_queue.put({
+                        'partial': True,
+                        'lam': actual,
+                        'matrix': matrix
+                    })
+                    time.sleep(0.05)  # flush multiprocessing queue before GIL blocks
+
                 if self.verbose:
                     print(f"SAT  (actual lambda={actual})  [{elapsed:.3f}s]"
                           f"  -> hi = {actual - 1}")
@@ -473,7 +494,7 @@ def _solve_worker(v, b, r, solver_name, encoding_name, sym_options, quiet, queue
     try:
         t_start = time.time()
         odp = OpdReifiedBound(v, b, r, solver_name=solver_name, encoding_name=encoding_name, sym_options=sym_options, verbose=not quiet)
-        optimal_M, matrix, _, n_vars, n_clauses = odp.solve()
+        optimal_M, matrix, _, n_vars, n_clauses = odp.solve(out_queue=queue)
         total_time = time.time() - t_start
         
         errors = []
@@ -482,13 +503,14 @@ def _solve_worker(v, b, r, solver_name, encoding_name, sym_options, quiet, queue
             errors, actual = odp.verify_solution(matrix, optimal_M)
             
         queue.put({
+            'final': True,
             'optimal_lambda': optimal_M,
             'matrix': matrix,
             'total_time': total_time,
             'n_vars': n_vars,
             'n_clauses': n_clauses,
             'applied_sym': getattr(odp, 'applied_sym', 'none'),
-            'status': 'Verification Failed' if errors else ('Solved' if matrix is not None else 'No Solution'),
+            'status': 'Verification Failed' if errors else ('Solved' if matrix is not None else 'UNSAT'),
             'errors': errors,
             'actual': actual
         })
@@ -528,10 +550,31 @@ def solve_from_file(filepath, solver_name='cadical195', encoding_name='sortnetwr
             if not quiet: print(f"\nTIMEOUT strictly enforced after {timeout} seconds.")
             p.terminate()
             p.join()
+            
+            stats = None
+            best_lam = None
+            
+            # Drain queue to get stats and best lambda before timeout
+            while not queue.empty():
+                res = queue.get()
+                if res.get('stats_only'):
+                    stats = res
+                elif res.get('partial'):
+                    best_lam = res['lam']
+                    
+            _n_vars = stats['n_vars'] if stats else 0
+            _n_clauses = stats['n_clauses'] if stats else 0
+            _sym = stats['applied_sym'] if stats else ("+".join(sym_options) if sym_options else 'none')
+            
+            if best_lam is not None and not quiet:
+                print(f"Partial Result before TIMEOUT: best lambda = {best_lam}")
+            if not quiet:
+                print(f"Variables: {_n_vars}, Clauses: {_n_clauses}")
+
             return {
                 'File': filename, 'v': v, 'b': b, 'r': r,
                 'Solver': solver_name, 'Encoding': encoding_name,
-                'Optimal Lambda': None, 'Variables': 0, 'Clauses': 0, 'Sym Method': "+".join(sym_options) if sym_options else 'none', 'Time (s)': round(elapsed, 3), 'Status': 'Timeout'
+                'Optimal Lambda': best_lam, 'Variables': _n_vars, 'Clauses': _n_clauses, 'Sym Method': _sym, 'Time (s)': round(elapsed, 3), 'Status': 'Timeout'
             }
     except KeyboardInterrupt:
         print("\n[Ctrl+C] Đã tiếp nhận yêu cầu dừng từ người dùng. Đang hủy tiến trình...")
@@ -539,55 +582,80 @@ def solve_from_file(filepath, solver_name='cadical195', encoding_name='sortnetwr
         p.join()
         sys.exit(1)
         
-    if not queue.empty():
-        result = queue.get()
-        if 'error' in result:
-            if not quiet: print(f"Solver error: {result['error']}")
-            return {
-                'File': filename, 'v': v, 'b': b, 'r': r,
-                'Solver': solver_name, 'Encoding': encoding_name,
-                'Optimal Lambda': None, 'Variables': 0, 'Clauses': 0, 'Sym Method': 'none', 'Time (s)': 0, 'Status': f"Error: {result['error']}"
-            }
-            
-        optimal_M = result['optimal_lambda']
-        matrix = result['matrix']
-        total_time = elapsed
-        status = result['status']
-        n_vars = result.get('n_vars', 0)
-        n_clauses = result.get('n_clauses', 0)
-        applied_sym = result.get('applied_sym', 'none')
-        
-        if status == 'Verification Failed' and not quiet:
-            for e in result['errors']:
-                print(f"  VERIFY ERROR: {e}")
-        elif matrix is not None and not quiet:
-            actual = result['actual']
-            lb = max(0, math.ceil(r * (r * v - b) / (b * (v - 1)))) if v > 1 else 0
-            print(f"\nRESULT:")
-            print(f"  Optimal lambda = {optimal_M}")
-            print(f"  Verified max overlap = {actual}")
-            print(f"  Total time = {total_time:.3f}s")
-            print(f"  Solver: {solver_name}, Encoding: {encoding_name}")
-            print(f"  Variables: {n_vars}, Clauses: {n_clauses}, Sym Method: {applied_sym}")
-            if optimal_M == lb:
-                print(f"  ✓ Optimal! (matches lower bound {lb})")
-            else:
-                print(f"  Gap from lower bound: {optimal_M - lb}")
-        elif matrix is None and not quiet:
-            print(f"\nBest M = {optimal_M}, Time = {total_time:.3f}s")
+    # Drain queue to get the final result or error
+    final_result = None
+    stats_only = None
+    best_lam = None
+    
+    while not queue.empty():
+        res = queue.get()
+        if res.get('stats_only'):
+            stats_only = res
+        elif res.get('partial'):
+            best_lam = res['lam']
+        elif 'error' in res or res.get('final'):
+            final_result = res
 
-        return {'File': filename, 'v': v, 'b': b, 'r': r,
-                'Solver': solver_name, 'Encoding': encoding_name,
-                'Optimal Lambda': optimal_M, 'Variables': n_vars, 'Clauses': n_clauses, 'Sym Method': applied_sym,
-                'Time (s)': round(total_time, 3),
-                'Status': status}
-    else:
+    if final_result is None:
         if not quiet: print(f"Process crashed or returned no result.")
+        _n_vars = stats_only['n_vars'] if stats_only else 0
+        _n_clauses = stats_only['n_clauses'] if stats_only else 0
+        _sym = stats_only['applied_sym'] if stats_only else ("+".join(sym_options) if sym_options else 'none')
+        if best_lam is not None and not quiet:
+            print(f"Partial Result before CRASH: best lambda = {best_lam}")
+        if not quiet:
+            print(f"Variables: {_n_vars}, Clauses: {_n_clauses}")
         return {
             'File': filename, 'v': v, 'b': b, 'r': r,
             'Solver': solver_name, 'Encoding': encoding_name,
-            'Optimal Lambda': None, 'Variables': 0, 'Clauses': 0, 'Sym Method': 'none', 'Time (s)': round(elapsed, 3), 'Status': 'Crashed'
+            'Optimal Lambda': best_lam, 'Variables': _n_vars, 'Clauses': _n_clauses, 'Sym Method': _sym, 'Time (s)': round(elapsed, 3), 'Status': 'Crashed'
         }
+
+    if 'error' in final_result:
+        if not quiet: print(f"Solver error: {final_result['error']}")
+        _n_vars = stats_only['n_vars'] if stats_only else 0
+        _n_clauses = stats_only['n_clauses'] if stats_only else 0
+        _sym = stats_only['applied_sym'] if stats_only else ("+".join(sym_options) if sym_options else 'none')
+        if not quiet:
+            print(f"Variables: {_n_vars}, Clauses: {_n_clauses}")
+        return {
+            'File': filename, 'v': v, 'b': b, 'r': r,
+            'Solver': solver_name, 'Encoding': encoding_name,
+            'Optimal Lambda': best_lam, 'Variables': _n_vars, 'Clauses': _n_clauses, 'Sym Method': _sym, 'Time (s)': 0, 'Status': f"Error: {final_result['error']}"
+        }
+        
+    optimal_M = final_result['optimal_lambda']
+    matrix = final_result['matrix']
+    total_time = elapsed
+    status = final_result['status']
+    n_vars = final_result.get('n_vars', 0)
+    n_clauses = final_result.get('n_clauses', 0)
+    applied_sym = final_result.get('applied_sym', 'none')
+        
+    if status == 'Verification Failed' and not quiet:
+        for e in final_result['errors']:
+            print(f"  VERIFY ERROR: {e}")
+    elif matrix is not None and not quiet:
+        actual = final_result['actual']
+        lb = max(0, math.ceil(r * (r * v - b) / (b * (v - 1)))) if v > 1 else 0
+        print(f"\nRESULT:")
+        print(f"  Optimal lambda = {optimal_M}")
+        print(f"  Verified max overlap = {actual}")
+        print(f"  Total time = {total_time:.3f}s")
+        print(f"  Solver: {solver_name}, Encoding: {encoding_name}")
+        print(f"  Variables: {n_vars}, Clauses: {n_clauses}, Sym Method: {applied_sym}")
+        if optimal_M == lb:
+            print(f"  ✓ Optimal! (matches lower bound {lb})")
+        else:
+            print(f"  Gap from lower bound: {optimal_M - lb}")
+    elif matrix is None and not quiet:
+        print(f"\nBest M = {optimal_M}, Time = {total_time:.3f}s")
+
+    return {'File': filename, 'v': v, 'b': b, 'r': r,
+            'Solver': solver_name, 'Encoding': encoding_name,
+            'Optimal Lambda': optimal_M, 'Variables': n_vars, 'Clauses': n_clauses, 'Sym Method': applied_sym,
+            'Time (s)': round(total_time, 3),
+            'Status': status}
 
 
 # ---------------------------------------------------------------------------

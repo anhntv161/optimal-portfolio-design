@@ -565,7 +565,7 @@ Examples:
     
     parser.add_argument('--input', type=str, required=True,
                        help='Input file or directory path')
-    parser.add_argument('--timeout', type=int, default=120,
+    parser.add_argument('--timeout', type=int, default=3600,
                        help='Timeout per instance (seconds)')
     parser.add_argument('--sym', nargs='+', default=[],
                        help='Symmetry breaking methods (e.g., lex_row lex_col)')
